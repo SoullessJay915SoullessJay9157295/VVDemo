@@ -1,0 +1,6 @@
+framework module MQCocoaAsyncSocket {
+  umbrella header "MQCocoaAsyncSocket-umbrella.h"
+
+  export *
+  module * { export * }
+}
