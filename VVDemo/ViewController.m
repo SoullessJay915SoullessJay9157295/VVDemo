@@ -212,101 +212,138 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         NSLog(@"sampleBuffer data not ready");
         return;
     }
-    
+
     ViewController *vc = (__bridge ViewController *)outputCallbackRefCon;
-    
-    // 提取 SPS/PPS（在 key frame 时从 format description 获取）
+
+    // ---- 从 format description 尝试抓取 SPS/PPS 并拿到 nalUnitHeaderLength ----
     CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
-    if (formatDesc && !vc.spsData) {
-        // 获取 parameter sets
-        size_t spsSize, ppsSize;
-        size_t spsCount, ppsCount;   // 改成 size_t
-        const uint8_t *spsPtr, *ppsPtr;
+    if (formatDesc) {
+        const uint8_t *spsPtr = NULL, *ppsPtr = NULL;
+        size_t spsSize = 0, ppsSize = 0;
+        size_t spsCount = 0, ppsCount = 0;
+        int nalHeaderLen = 0;
 
         OSStatus err = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDesc,
                                                                          0,
                                                                          &spsPtr,
                                                                          &spsSize,
                                                                          &spsCount,
-                                                                         NULL);
+                                                                         &nalHeaderLen);
         if (err == noErr) {
             err = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDesc,
                                                                      1,
                                                                      &ppsPtr,
                                                                      &ppsSize,
                                                                      &ppsCount,
-                                                                     NULL);
-            if (err == noErr) {
+                                                                     &nalHeaderLen);
+            if (err == noErr && spsSize > 0 && ppsSize > 0) {
                 vc.spsData = [NSData dataWithBytes:spsPtr length:spsSize];
                 vc.ppsData = [NSData dataWithBytes:ppsPtr length:ppsSize];
-                NSLog(@"Got SPS (%zu bytes) PPS (%zu bytes)", spsSize, ppsSize);
+                vc.nalUnitLength = nalHeaderLen; // 保存 length 字段大小（通常是 4）
+                NSLog(@"Got SPS(%zu) PPS(%zu) nalLen=%d", spsSize, ppsSize, nalHeaderLen);
+
+                if (vc.spsData.length > 0) {
+                    const uint8_t *b = vc.spsData.bytes;
+                    NSLog(@"SPS first byte: 0x%02x type=%d", b[0], b[0] & 0x1F);
+                }
+                if (vc.ppsData.length > 0) {
+                    const uint8_t *b = vc.ppsData.bytes;
+                    NSLog(@"PPS first byte: 0x%02x type=%d", b[0], b[0] & 0x1F);
+                }
             }
         }
     }
 
-    
-    // 检查是否为关键帧
-    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true);
-    bool isKeyFrame = false;
-    if (attachments && CFArrayGetCount(attachments) > 0) {
-        CFDictionaryRef dict = CFArrayGetValueAtIndex(attachments, 0);
-        CFBooleanRef notSync = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_NotSync);
-        if (notSync == kCFBooleanFalse) {
-            isKeyFrame = true;
-        }
-    }
-    
-    // 获取编码数据
+    // ---- 读取 CMBlockBuffer ----
     CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
-    size_t lengthAtOffset = 0;
+    if (!dataBuffer) return;
+
     size_t totalLength = 0;
     char *dataPointer = NULL;
+    size_t lengthAtOffset = 0;
     OSStatus err = CMBlockBufferGetDataPointer(dataBuffer, 0, &lengthAtOffset, &totalLength, &dataPointer);
-    if (err != noErr) {
+    if (err != noErr || !dataPointer || totalLength == 0) {
         NSLog(@"CMBlockBufferGetDataPointer error: %d", (int)err);
         return;
     }
-    
-    // NALU length is stored as 4-byte big-endian before each NAL
-    size_t offset = 0;
     const uint8_t *buf = (const uint8_t *)dataPointer;
-    
-    // Prepare mutable data to send
+
+    // 使用从 formatDesc 读到的 nal length（默认 4）
+    int nalHeaderLen = vc.nalUnitLength > 0 ? vc.nalUnitLength : 4;
+
+    // ---- 先扫描一次，判断是否包含 IDR (nal type == 5) ----
+    BOOL foundIDR = NO;
+    size_t scanOffset = 0;
+    while (scanOffset + nalHeaderLen <= totalLength) {
+        uint32_t nalLength = 0;
+        if (nalHeaderLen == 4) {
+            uint32_t tmp = 0;
+            memcpy(&tmp, buf + scanOffset, 4);
+            nalLength = CFSwapInt32BigToHost(tmp);
+        } else {
+            nalLength = 0;
+            for (int i = 0; i < nalHeaderLen; i++) {
+                nalLength = (nalLength << 8) | buf[scanOffset + i];
+            }
+        }
+        scanOffset += nalHeaderLen;
+        if (nalLength == 0 || scanOffset + nalLength > totalLength) break;
+        uint8_t nalType = buf[scanOffset] & 0x1F;
+        if (nalType == 5) { foundIDR = YES; break; }
+        scanOffset += nalLength;
+    }
+
+    // ---- 构造输出 Annex-B 数据 ----
     NSMutableData *outData = [NSMutableData data];
-    
-    // If keyframe, prepend SPS/PPS in Annex-B
-    if (isKeyFrame && vc.spsData && vc.ppsData) {
-        // startcode
-        const uint8_t startCode[] = {0x00,0x00,0x00,0x01};
-        [outData appendBytes:startCode length:4];
+    const uint8_t startCode4[4] = {0x00,0x00,0x00,0x01};
+
+    // 如果有 IDR，且我们已有 SPS/PPS，则在前面发送 SPS/PPS（保证 dec 有参数集）
+    if (foundIDR && vc.spsData && vc.ppsData) {
+        [outData appendBytes:startCode4 length:4];
         [outData appendData:vc.spsData];
-        [outData appendBytes:startCode length:4];
+        [outData appendBytes:startCode4 length:4];
         [outData appendData:vc.ppsData];
     }
-    
-    while (offset + 4 <= totalLength) {
+
+    // 把 AVCC length-prefixed 转为 Annex-B
+    size_t offset = 0;
+    while (offset + nalHeaderLen <= totalLength) {
         uint32_t nalLength = 0;
-        // 4 bytes big-endian
-        nalLength = (uint32_t)((buf[offset] << 24) | (buf[offset+1] << 16) | (buf[offset+2] << 8) | (buf[offset+3]));
-        offset += 4;
+        if (nalHeaderLen == 4) {
+            uint32_t tmp = 0;
+            memcpy(&tmp, buf + offset, 4);
+            nalLength = CFSwapInt32BigToHost(tmp);
+        } else {
+            nalLength = 0;
+            for (int i = 0; i < nalHeaderLen; i++) {
+                nalLength = (nalLength << 8) | buf[offset + i];
+            }
+        }
+        offset += nalHeaderLen;
+        if (nalLength == 0) continue;
         if (offset + nalLength > totalLength) {
-            NSLog(@"NAL length overrun");
+            NSLog(@"NAL length overrun: offset=%zu nalLength=%u total=%zu", offset, nalLength, totalLength);
             break;
         }
-        // append start code + nal unit
-        const uint8_t startCode[] = {0x00,0x00,0x00,0x01};
-        [outData appendBytes:startCode length:4];
+        [outData appendBytes:startCode4 length:4];
         [outData appendBytes:buf + offset length:nalLength];
-        
         offset += nalLength;
     }
-    
+
+    // debug: 打印前 32 字节 hex，观察是否是 00 00 00 01 67 ... 00 00 00 01 68 ... 00 00 00 01 65 ...
+    size_t show = MIN((size_t)32, outData.length);
+    NSMutableString *hex = [NSMutableString string];
+    const uint8_t *o = outData.bytes;
+    for (size_t i = 0; i < show; i++) {
+        [hex appendFormat:@"%02x ", o[i]];
+    }
+    NSLog(@"-> send h264 len:%lu first:%@", (unsigned long)outData.length, hex);
+
+    // 发送
     if (outData.length > 0) {
-        // send via socket on socketQueue
         dispatch_async(vc.socketQueue, ^{
             if (vc.socket && vc.socket.isConnected) {
                 [vc.socket writeData:outData withTimeout:-1 tag:0];
-                // 你也可以添加一些自定义包头（例如帧号、时间戳）以便接收端解析
             }
         });
     }
