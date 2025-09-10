@@ -87,7 +87,7 @@
     self.socket = [[GCDAsyncSocket alloc] initWithDelegate:self delegateQueue:self.socketQueue];
     
     NSError *error = nil;
-    NSString *ip = @"192.168.1.100"; // 目标IP
+    NSString *ip = @"192.168.0.112"; // 目标IP
     uint16_t port = 9000;           // 目标端口
     
     if (![self.socket connectToHost:ip onPort:port error:&error]) {
