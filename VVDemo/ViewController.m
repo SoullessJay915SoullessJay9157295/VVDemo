@@ -1,11 +1,7 @@
 //
 //  ViewController.m
 //  Created on 2025/9/9
-//  Description <#文件描述#>
-//  PD <#产品文档地址#>
-//  Design <#设计文档地址#>
-//  Copyright © 2025 LMKJ. All rights reserved.
-//  @author 刘小彬(liuxiaomike@gmail.com)
+//  Description: 动态小球循环动画 + ReplayKit H264 推流
 //
 
 #import "ViewController.h"
@@ -29,6 +25,11 @@
 @property (nonatomic, assign) int width, height;
 @property (nonatomic, strong) NSData *spsData, *ppsData;
 @property (nonatomic, assign) int nalUnitLength;
+
+// 动态动画层
+@property (nonatomic, strong) UIView *animationView;
+@property (nonatomic, strong) NSMutableArray<UIView *> *movingBalls;
+@property (nonatomic, strong) NSMutableArray<NSValue *> *ballVelocities; // dx,dy
 @end
 
 @implementation ViewController
@@ -53,13 +54,44 @@
 
 #pragma mark - UI
 - (void)setupUI {
+    // 时间label
     self.timeLabel = [self createLabelWithFrame:CGRectMake(100, 200, 200, 50)];
     [self.view addSubview:self.timeLabel];
     
+    // 连接按钮
     self.connectButton = [self createButtonWithFrame:CGRectMake(100, 300, 150, 50)
                                                title:@"开始发送"
                                               action:@selector(startSocketAndSend)];
     [self.view addSubview:self.connectButton];
+    
+    // 动画层
+    self.animationView = [[UIView alloc] initWithFrame:self.view.bounds];
+    self.animationView.backgroundColor = [UIColor whiteColor];
+    [self.view addSubview:self.animationView];
+    [self.view sendSubviewToBack:self.animationView];
+    
+    // 初始化小球和速度
+    self.movingBalls = [NSMutableArray array];
+    self.ballVelocities = [NSMutableArray array];
+    int ballCount = 50;
+    for (int i = 0; i < ballCount; i++) {
+        CGFloat radius = 10 + arc4random_uniform(10);
+        UIView *ball = [[UIView alloc] initWithFrame:CGRectMake(arc4random_uniform((int)self.view.bounds.size.width),
+                                                                arc4random_uniform((int)self.view.bounds.size.height),
+                                                                radius*2, radius*2)];
+        ball.backgroundColor = [UIColor colorWithHue:(arc4random_uniform(100)/100.0)
+                                         saturation:0.8
+                                         brightness:1
+                                              alpha:1];
+        ball.layer.cornerRadius = radius;
+        [self.animationView addSubview:ball];
+        [self.movingBalls addObject:ball];
+        
+        // 随机速度 dx, dy (-5~5)
+        CGFloat dx = (arc4random_uniform(11) - 5);
+        CGFloat dy = (arc4random_uniform(11) - 5);
+        [self.ballVelocities addObject:[NSValue valueWithCGPoint:CGPointMake(dx, dy)]];
+    }
 }
 
 - (UILabel *)createLabelWithFrame:(CGRect)frame {
@@ -144,6 +176,11 @@
 
 - (void)displayLinkFired:(CADisplayLink *)link {
     self.frameCount++;
+    
+    // 更新动画元素
+    [self updateAnimation];
+    
+    // 截屏发送
     [self captureScreenWithCompletion:^(UIImage *image) {
         if (image) {
             dispatch_async(self.encoderQueue, ^{
@@ -153,6 +190,32 @@
     }];
 }
 
+#pragma mark - 动画更新
+- (void)updateAnimation {
+    for (int i = 0; i < self.movingBalls.count; i++) {
+        UIView *ball = self.movingBalls[i];
+        CGPoint velocity = [self.ballVelocities[i] CGPointValue];
+        
+        CGPoint center = ball.center;
+        center.x += velocity.x;
+        center.y += velocity.y;
+        
+        // 边界反弹
+        if (center.x < 0 || center.x > self.animationView.bounds.size.width) {
+            velocity.x = -velocity.x;
+            center.x += velocity.x;
+        }
+        if (center.y < 0 || center.y > self.animationView.bounds.size.height) {
+            velocity.y = -velocity.y;
+            center.y += velocity.y;
+        }
+        
+        ball.center = center;
+        self.ballVelocities[i] = [NSValue valueWithCGPoint:velocity];
+    }
+}
+
+#pragma mark - Capture Screen
 - (void)captureScreenWithCompletion:(void(^)(UIImage *))completion {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *window = [self currentWindowOnMainThread];
@@ -213,7 +276,6 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     const uint8_t *buf = (const uint8_t *)dataPtr;
     int nalLenSize = vc.nalUnitLength > 0 ? vc.nalUnitLength : 4;
     
-    // 检测是否包含 IDR
     BOOL hasIDR = NO; size_t off = 0;
     while (off + nalLenSize <= totalLen) {
         uint32_t nalLen = (nalLenSize == 4) ? CFSwapInt32BigToHost(*(uint32_t *)(buf+off)) : parseNalLength(buf+off, nalLenSize);
@@ -229,7 +291,6 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         [out appendBytes:startCode length:4]; [out appendData:vc.ppsData];
     }
     
-    // 转 Annex-B
     size_t offset = 0;
     while (offset + nalLenSize <= totalLen) {
         uint32_t nalLen = (nalLenSize == 4) ? CFSwapInt32BigToHost(*(uint32_t *)(buf+offset)) : parseNalLength(buf+offset, nalLenSize);
@@ -321,4 +382,5 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     VTCompressionSessionEncodeFrame(self.compressionSession, buf, pts, dur, NULL, NULL, &flags);
     CVPixelBufferRelease(buf);
 }
+
 @end
