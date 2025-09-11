@@ -26,10 +26,11 @@
 @property (nonatomic, strong) NSData *spsData, *ppsData;
 @property (nonatomic, assign) int nalUnitLength;
 
-// 动态动画层
 @property (nonatomic, strong) UIView *animationView;
 @property (nonatomic, strong) NSMutableArray<UIView *> *movingBalls;
-@property (nonatomic, strong) NSMutableArray<NSValue *> *ballVelocities; // dx,dy
+@property (nonatomic, strong) NSMutableArray<NSValue *> *ballVelocities;
+
+@property (nonatomic, assign) int fps; // 可配置帧率
 @end
 
 @implementation ViewController
@@ -37,9 +38,10 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.seconds = 0;
+    self.fps = 30; // 默认帧率
     self.socketQueue = dispatch_queue_create("com.demo.socketQueue", DISPATCH_QUEUE_CONCURRENT);
     self.encoderQueue = dispatch_queue_create("com.demo.encoderQueue", DISPATCH_QUEUE_SERIAL);
-    
+
     [self setupUI];
     [self startTimer];
 }
@@ -54,23 +56,19 @@
 
 #pragma mark - UI
 - (void)setupUI {
-    // 时间label
     self.timeLabel = [self createLabelWithFrame:CGRectMake(100, 200, 200, 50)];
     [self.view addSubview:self.timeLabel];
-    
-    // 连接按钮
+
     self.connectButton = [self createButtonWithFrame:CGRectMake(100, 300, 150, 50)
                                                title:@"开始发送"
                                               action:@selector(startSocketAndSend)];
     [self.view addSubview:self.connectButton];
-    
-    // 动画层
+
     self.animationView = [[UIView alloc] initWithFrame:self.view.bounds];
     self.animationView.backgroundColor = [UIColor whiteColor];
     [self.view addSubview:self.animationView];
     [self.view sendSubviewToBack:self.animationView];
-    
-    // 初始化小球和速度
+
     self.movingBalls = [NSMutableArray array];
     self.ballVelocities = [NSMutableArray array];
     int ballCount = 50;
@@ -86,8 +84,7 @@
         ball.layer.cornerRadius = radius;
         [self.animationView addSubview:ball];
         [self.movingBalls addObject:ball];
-        
-        // 随机速度 dx, dy (-5~5)
+
         CGFloat dx = (arc4random_uniform(11) - 5);
         CGFloat dy = (arc4random_uniform(11) - 5);
         [self.ballVelocities addObject:[NSValue valueWithCGPoint:CGPointMake(dx, dy)]];
@@ -131,7 +128,7 @@
     NSError *error = nil;
     NSString *ip = @"192.168.0.112";
     uint16_t port = 9000;
-    
+
     if (![self.socket connectToHost:ip onPort:port error:&error]) {
         NSLog(@"连接失败: %@", error);
     } else {
@@ -141,13 +138,13 @@
 
 - (void)socket:(GCDAsyncSocket *)sock didConnectToHost:(NSString *)host port:(uint16_t)port {
     NSLog(@"连接成功: %@:%d", host, port);
-    
+
     CGSize size = UIScreen.mainScreen.bounds.size;
     int w = (int)round(size.width), h = (int)round(size.height);
     if (w % 2) w--; if (h % 2) h--;
     
     dispatch_async(self.encoderQueue, ^{
-        [self startCompressionSessionWithWidth:w height:h fps:30 bitrate:1000*1000];
+        [self startCompressionSessionWithWidth:w height:h fps:self.fps bitrate:1000*1000];
     });
     dispatch_async(dispatch_get_main_queue(), ^{
         [self startDisplayLink];
@@ -165,7 +162,7 @@
     if (self.displayLink) return;
     self.frameCount = 0;
     self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkFired:)];
-    self.displayLink.preferredFramesPerSecond = 30;
+    self.displayLink.preferredFramesPerSecond = self.fps;
     [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
 }
 
@@ -176,18 +173,11 @@
 
 - (void)displayLinkFired:(CADisplayLink *)link {
     self.frameCount++;
-    
-    // 更新动画元素
     [self updateAnimation];
-    
-    // 截屏发送
-    [self captureScreenWithCompletion:^(UIImage *image) {
-        if (image) {
-            dispatch_async(self.encoderQueue, ^{
-                [self encodeUIImage:image atFrame:self.frameCount];
-            });
-        }
-    }];
+
+    dispatch_async(self.encoderQueue, ^{
+        [self encodeAnimationViewLayer];
+    });
 }
 
 #pragma mark - 动画更新
@@ -195,12 +185,11 @@
     for (int i = 0; i < self.movingBalls.count; i++) {
         UIView *ball = self.movingBalls[i];
         CGPoint velocity = [self.ballVelocities[i] CGPointValue];
-        
+
         CGPoint center = ball.center;
         center.x += velocity.x;
         center.y += velocity.y;
-        
-        // 边界反弹
+
         if (center.x < 0 || center.x > self.animationView.bounds.size.width) {
             velocity.x = -velocity.x;
             center.x += velocity.x;
@@ -209,33 +198,10 @@
             velocity.y = -velocity.y;
             center.y += velocity.y;
         }
-        
+
         ball.center = center;
         self.ballVelocities[i] = [NSValue valueWithCGPoint:velocity];
     }
-}
-
-#pragma mark - Capture Screen
-- (void)captureScreenWithCompletion:(void(^)(UIImage *))completion {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIWindow *window = [self currentWindowOnMainThread];
-        if (!window) return completion(nil);
-        
-        UIGraphicsBeginImageContextWithOptions(window.bounds.size, NO, 1.0);
-        [window drawViewHierarchyInRect:window.bounds afterScreenUpdates:NO];
-        UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
-        completion(image);
-    });
-}
-
-- (UIWindow *)currentWindowOnMainThread {
-    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *w in scene.windows) if (w.isKeyWindow) return w;
-        }
-    }
-    return nil;
 }
 
 #pragma mark - VideoToolbox
@@ -254,7 +220,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
                                       CMSampleBufferRef sampleBuffer) {
     if (status != noErr || !CMSampleBufferDataIsReady(sampleBuffer)) return;
     ViewController *vc = (__bridge ViewController *)outputCallbackRefCon;
-    
+
     CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sampleBuffer);
     if (fmt && !vc.spsData) {
         const uint8_t *sps, *pps; size_t spsSize, ppsSize;
@@ -264,18 +230,17 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
             vc.spsData = [NSData dataWithBytes:sps length:spsSize];
             vc.ppsData = [NSData dataWithBytes:pps length:ppsSize];
             vc.nalUnitLength = nalLen;
-            NSLog(@"Got SPS(%zu) PPS(%zu) nalLen=%d", spsSize, ppsSize, nalLen);
         }
     }
-    
+
     CMBlockBufferRef dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
     if (!dataBuffer) return;
-    
+
     size_t totalLen; char *dataPtr; size_t offsetLen;
     if (CMBlockBufferGetDataPointer(dataBuffer, 0, &offsetLen, &totalLen, &dataPtr) != noErr) return;
     const uint8_t *buf = (const uint8_t *)dataPtr;
     int nalLenSize = vc.nalUnitLength > 0 ? vc.nalUnitLength : 4;
-    
+
     BOOL hasIDR = NO; size_t off = 0;
     while (off + nalLenSize <= totalLen) {
         uint32_t nalLen = (nalLenSize == 4) ? CFSwapInt32BigToHost(*(uint32_t *)(buf+off)) : parseNalLength(buf+off, nalLenSize);
@@ -283,14 +248,14 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         if ((buf[off] & 0x1F) == 5) { hasIDR = YES; break; }
         off += nalLen;
     }
-    
+
     NSMutableData *out = [NSMutableData data];
     const uint8_t startCode[4] = {0,0,0,1};
     if (hasIDR && vc.spsData && vc.ppsData) {
         [out appendBytes:startCode length:4]; [out appendData:vc.spsData];
         [out appendBytes:startCode length:4]; [out appendData:vc.ppsData];
     }
-    
+
     size_t offset = 0;
     while (offset + nalLenSize <= totalLen) {
         uint32_t nalLen = (nalLenSize == 4) ? CFSwapInt32BigToHost(*(uint32_t *)(buf+offset)) : parseNalLength(buf+offset, nalLenSize);
@@ -300,7 +265,7 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
         [out appendBytes:buf+offset length:nalLen];
         offset += nalLen;
     }
-    
+
     if (out.length) {
         dispatch_async(vc.socketQueue, ^{
             if (vc.socket.isConnected) [vc.socket writeData:out withTimeout:-1 tag:0];
@@ -311,32 +276,32 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
 - (void)startCompressionSessionWithWidth:(int)w height:(int)h fps:(int)fps bitrate:(int)bitrate {
     [self stopCompressionSession];
     self.width = w; self.height = h; self.frameCount = 0;
-    
+
     OSStatus s = VTCompressionSessionCreate(NULL, w, h, kCMVideoCodecType_H264,
                                             NULL, NULL, NULL,
                                             compressionOutputCallback,
                                             (__bridge void *)self, &_compressionSession);
     if (s != noErr) return;
-    
+
     VTSessionSetProperty(self.compressionSession, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     CFNumberRef br = CFNumberCreate(NULL, kCFNumberIntType, &bitrate);
     VTSessionSetProperty(self.compressionSession, kVTCompressionPropertyKey_AverageBitRate, br);
     CFRelease(br);
-    
+
     int maxBR = bitrate * 2;
     CFNumberRef maxRef = CFNumberCreate(NULL, kCFNumberIntType, &maxBR);
     VTSessionSetProperty(self.compressionSession, kVTCompressionPropertyKey_DataRateLimits, maxRef);
     CFRelease(maxRef);
-    
+
     int gop = fps;
     CFNumberRef gopRef = CFNumberCreate(NULL, kCFNumberIntType, &gop);
     VTSessionSetProperty(self.compressionSession, kVTCompressionPropertyKey_MaxKeyFrameInterval, gopRef);
     CFRelease(gopRef);
-    
+
     CFNumberRef fpsRef = CFNumberCreate(NULL, kCFNumberIntType, &fps);
     VTSessionSetProperty(self.compressionSession, kVTCompressionPropertyKey_ExpectedFrameRate, fpsRef);
     CFRelease(fpsRef);
-    
+
     VTSessionSetProperty(self.compressionSession, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel);
     VTCompressionSessionPrepareToEncodeFrames(self.compressionSession);
 }
@@ -350,11 +315,11 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     self.spsData = self.ppsData = nil;
 }
 
-#pragma mark - UIImage -> Encode
-- (void)encodeUIImage:(UIImage *)image atFrame:(NSInteger)frameIndex {
+#pragma mark - Encode AnimationView
+- (void)encodeAnimationViewLayer {
     if (!self.compressionSession) return;
+
     int w = self.width, h = self.height;
-    
     NSDictionary *attrs = @{
         (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
         (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
@@ -364,20 +329,22 @@ static void compressionOutputCallback(void *outputCallbackRefCon,
     };
     CVPixelBufferRef buf = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &buf) != kCVReturnSuccess) return;
-    
+
     CVPixelBufferLockBaseAddress(buf, 0);
-    CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(buf), w, h, 8,
+    CGContextRef ctx = CGBitmapContextCreate(CVPixelBufferGetBaseAddress(buf),
+                                             w, h, 8,
                                              CVPixelBufferGetBytesPerRow(buf),
                                              CGColorSpaceCreateDeviceRGB(),
                                              kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
-    if (ctx) {
-        CGContextDrawImage(ctx, CGRectMake(0,0,w,h), image.CGImage);
-        CGContextRelease(ctx);
-    }
-    CVPixelBufferUnlockBaseAddress(buf, 0);
+    CGContextTranslateCTM(ctx, 0, h);
+    CGContextScaleCTM(ctx, 1.0, -1.0);
     
-    CMTime pts = CMTimeMake(self.frameCount, 30);
-    CMTime dur = CMTimeMake(1, 30);
+    [self.view.layer renderInContext:ctx];
+    CGContextRelease(ctx);
+    CVPixelBufferUnlockBaseAddress(buf, 0);
+
+    CMTime pts = CMTimeMake(self.frameCount, self.fps);
+    CMTime dur = CMTimeMake(1, self.fps);
     VTEncodeInfoFlags flags;
     VTCompressionSessionEncodeFrame(self.compressionSession, buf, pts, dur, NULL, NULL, &flags);
     CVPixelBufferRelease(buf);
